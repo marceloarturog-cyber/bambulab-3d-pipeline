@@ -1,10 +1,11 @@
 import os
 import shutil
+import io
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -12,15 +13,26 @@ from app.models.project import Project, Model3D, Conversion
 from app.api.schemas import (
     ProjectCreate, ProjectResponse, Model3DResponse,
     ConversionRequest, ConversionResponse, PipelineStatusResponse,
+    ChatRequest, ChatResponse, MeasureRequest, ColorRequest, Export3MFRequest,
 )
 from app.services.mesh_processor import (
     MeshProcessor, SUPPORTED_FORMATS, SCALE_PRESETS,
     BAMBU_PRINTERS, PRINT_PROFILES,
 )
+from app.services.ai_engine import AIEngine
+from app.services.mesh_modifier import MeshModifier
+from app.services.measurement_service import MeasurementService
+from app.services.color_manager import ColorManager
 from app.core.config import settings
 
 router = APIRouter()
 processor = MeshProcessor()
+ai_engine = AIEngine()
+mesh_modifier = MeshModifier()
+measurement_service = MeasurementService()
+color_manager = ColorManager()
+
+_mesh_cache: dict[int, "import('trimesh').Trimesh"] = {}
 
 
 # ─── Pipeline Info ───
@@ -245,4 +257,160 @@ def download_stl(conversion_id: int, db: Session = Depends(get_db)):
         conversion.output_path,
         media_type="application/octet-stream",
         filename=Path(conversion.output_path).name,
+    )
+
+
+# ─── Mesh Data (for 3D viewer) ───
+
+def _load_mesh(model_id: int, db: Session) -> "import('trimesh').Trimesh":
+    if model_id in _mesh_cache:
+        return _mesh_cache[model_id]
+    model = db.query(Model3D).filter(Model3D.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Modelo no encontrado")
+    if not Path(model.file_path).exists():
+        raise HTTPException(status_code=404, detail="Archivo no encontrado en disco")
+    mesh = processor.load(model.file_path)
+    _mesh_cache[model_id] = mesh
+    return mesh
+
+
+@router.get("/models/{model_id}/mesh-data")
+def get_mesh_data(model_id: int, db: Session = Depends(get_db)):
+    model = db.query(Model3D).filter(Model3D.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Modelo no encontrado")
+    if not Path(model.file_path).exists():
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+
+    mesh = _load_mesh(model_id, db)
+
+    buffer = io.BytesIO()
+    mesh.export(buffer, file_type='glb')
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="model/gltf-binary",
+        headers={"Content-Disposition": f"inline; filename={model.filename}.glb"},
+    )
+
+
+# ─── AI Chat ───
+
+@router.post("/ai/chat", response_model=ChatResponse)
+def ai_chat(req: ChatRequest, db: Session = Depends(get_db)):
+    mesh = _load_mesh(req.model_id, db)
+    info = processor.get_info(mesh)
+
+    model_context = {
+        "vertices": info.vertices,
+        "faces": info.faces,
+        "dimensions_mm": {
+            "x": info.dimensions_x,
+            "y": info.dimensions_y,
+            "z": info.dimensions_z,
+        },
+        "volume_mm3": info.volume,
+        "is_manifold": info.is_manifold,
+    }
+
+    ai_response = ai_engine.process_instruction(
+        message=req.message,
+        model_context=model_context,
+        conversation_history=req.history,
+    )
+
+    mesh_updated = False
+    modification = None
+
+    if ai_response.code:
+        result = mesh_modifier.execute_modification(
+            mesh=mesh,
+            code=ai_response.code,
+            description=ai_response.modification_description or "",
+        )
+
+        if result.success and result.mesh:
+            _mesh_cache[req.model_id] = result.mesh
+
+            db_model = db.query(Model3D).filter(Model3D.id == req.model_id).first()
+            if db_model:
+                new_info = processor.get_info(result.mesh)
+                db_model.vertices = new_info.vertices
+                db_model.faces = new_info.faces
+                db_model.dimensions_x = new_info.dimensions_x
+                db_model.dimensions_y = new_info.dimensions_y
+                db_model.dimensions_z = new_info.dimensions_z
+                db_model.is_manifold = new_info.is_manifold
+                db.commit()
+
+            mesh_updated = True
+            modification = {
+                "success": True,
+                "description": result.description,
+            }
+        else:
+            modification = {
+                "success": False,
+                "description": result.error or "Error desconocido",
+            }
+
+    return ChatResponse(
+        response=ai_response.response,
+        modification=modification,
+        mesh_updated=mesh_updated,
+    )
+
+
+# ─── Measurements ───
+
+@router.post("/models/{model_id}/measure")
+def measure_model(model_id: int, req: MeasureRequest, db: Session = Depends(get_db)):
+    mesh = _load_mesh(model_id, db)
+    result = measurement_service.measure_distance(mesh, req.point_a, req.point_b)
+    return result
+
+
+@router.get("/models/{model_id}/components")
+def get_components(model_id: int, db: Session = Depends(get_db)):
+    mesh = _load_mesh(model_id, db)
+    return measurement_service.detect_components(mesh)
+
+
+@router.get("/models/{model_id}/thickness")
+def get_thickness(model_id: int, db: Session = Depends(get_db)):
+    mesh = _load_mesh(model_id, db)
+    return measurement_service.analyze_thickness(mesh)
+
+
+# ─── Colors ───
+
+@router.post("/models/{model_id}/color")
+def set_model_color(model_id: int, req: ColorRequest, db: Session = Depends(get_db)):
+    mesh = _load_mesh(model_id, db)
+    updated = color_manager.apply_color_to_component(mesh, req.component_name, req.color)
+    _mesh_cache[model_id] = updated
+    return {"success": True}
+
+
+# ─── Export 3MF ───
+
+@router.post("/models/{model_id}/export/3mf")
+def export_3mf(model_id: int, req: Export3MFRequest, db: Session = Depends(get_db)):
+    mesh = _load_mesh(model_id, db)
+    model = db.query(Model3D).filter(Model3D.id == model_id).first()
+
+    output_dir = Path(settings.OUTPUT_DIR) / str(model.project_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = output_dir / f"{Path(model.filename).stem}_{timestamp}.3mf"
+
+    mesh.export(str(output_path), file_type='3mf')
+
+    return FileResponse(
+        str(output_path),
+        media_type="application/octet-stream",
+        filename=output_path.name,
     )

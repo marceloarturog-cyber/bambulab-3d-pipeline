@@ -91,3 +91,31 @@ class PipelineStatusResponse(BaseModel):
     available_scales: list[str]
     available_printers: list[str]
     available_profiles: dict
+
+
+class ChatRequest(BaseModel):
+    model_id: int
+    message: str
+    history: list[dict] = []
+
+
+class ChatResponse(BaseModel):
+    response: str
+    modification: Optional[dict] = None
+    mesh_updated: bool = False
+
+
+class MeasureRequest(BaseModel):
+    point_a: list[float]
+    point_b: list[float]
+
+
+class ColorRequest(BaseModel):
+    component_name: str
+    color: str
+
+
+class Export3MFRequest(BaseModel):
+    scale: Optional[str] = "1:100"
+    printer: str = "X1C"
+    profile: str = "maqueta_detalle"

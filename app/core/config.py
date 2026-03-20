@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    APP_NAME: str = "BambuLab 3D Pipeline"
+    APP_NAME: str = "BambuLab 3D AI Studio"
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
         "postgresql://postgres:password@localhost:5432/bambulab3d"
